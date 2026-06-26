@@ -1,0 +1,6 @@
+tile_cache/
+*.duckdb
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,9 @@
+python-pdal
+pvlib
+open3d
+duckdb
+geopandas
+numpy
+scipy
+requests
+pandas

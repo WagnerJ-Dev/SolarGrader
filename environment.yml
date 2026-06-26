@@ -1,0 +1,19 @@
+name: solar-grader
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pdal
+  - python-pdal
+  - geopandas
+  - shapely
+  - numpy
+  - scipy
+  - requests
+  - pip
+  - pip:
+      - pvlib
+      - open3d
+      - duckdb
+      - pandas
