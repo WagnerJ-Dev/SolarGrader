@@ -17,8 +17,14 @@ a bottleneck.
 **Frontend:** FastAPI + Leaflet.js + OpenStreetMap tiles.
 
 **Environment:**
-- Mac: `brew install pdal` then `pip install -r requirements.txt` (no conda needed)
+- Mac: `brew install pdal` then `pip install -r requirements.txt` in a venv (no conda needed)
 - Windows: conda-forge environment via environment.yml (PDAL native deps need conda on Windows)
+
+**PDAL pip gotcha (hit 2026-06-25):** The PyPI package is `pdal`, NOT `python-pdal`.
+`python-pdal` is the *conda* name; on PyPI it's an empty 0.0.1 stub that installs
+nothing. requirements.txt has been corrected to `pdal`. The pip `pdal` wheel builds
+against the Homebrew libpdal via pdal-config, so `brew install pdal` must come first.
+Verified working: Homebrew PDAL 2.10.2 + pip pdal 3.5.3 + Python 3.9.6 venv.
 
 **How to apply:** User prefers simple over complex. Don't suggest adding servers,
 Docker, or extra dependencies unless absolutely necessary.

@@ -1,4 +1,4 @@
-python-pdal
+pdal
 pvlib
 open3d
 duckdb

@@ -19,21 +19,44 @@ import pandas as pd
 import pdal
 import pvlib
 import requests
+import shapely
+from pyproj import Transformer
 from scipy.spatial import ConvexHull
 from shapely.geometry import Polygon
+from shapely.ops import transform as shapely_transform
 
 warnings.filterwarnings("ignore")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# Small test area: suburban Chester County, PA (near Exton)
-# Adjust this bbox to pick a different area — keep it small (0.02° × 0.02° max)
-TEST_BBOX = (-75.640, 40.015, -75.620, 40.030)  # (west, south, east, north)
-TEST_LAT = 40.022
-TEST_LON = -75.630
+# Small test area: residential single-family streets, West Chester borough, PA.
+# Picked because the goal is scoring HOMES — the old Exton bbox (below) was all
+# commercial/retail. Adjust these 4 numbers to target a different area; keep it
+# small (0.02° × 0.02° max). (west, south, east, north)
+TEST_BBOX = (-75.615, 39.955, -75.600, 39.970)
+TEST_LAT = 39.962
+TEST_LON = -75.607
+
+# Previous test area (Exton commercial strip — big-box roofs, no houses):
+#   TEST_BBOX = (-75.640, 40.015, -75.620, 40.030); TEST_LAT/LON = 40.022, -75.630
 
 TILE_CACHE_DIR = "tile_cache"   # LiDAR tiles cached here (re-used on re-runs)
 DB_PATH = "solar_results.duckdb"
+
+# ── Panel / system model ──────────────────────────────────────────────────────
+# All physical: change these to model different panels/configurations. The energy
+# model packs WHOLE panels onto each roof plane after a fire-code edge setback,
+# rather than assuming a fixed % of the roof is usable.
+PANEL_WIDTH_M     = 1.05    # standard residential module footprint (~1.05 × 1.74 m)
+PANEL_HEIGHT_M    = 1.74
+PANEL_WATTS       = 400     # module rated DC power at STC (1000 W/m²)
+ROOF_SETBACK_M    = 0.46    # fire-code clear pathway from plane edges (~18 inches)
+PANEL_PACKING     = 0.90    # fraction of the setback area that packs into whole modules
+SYSTEM_LOSSES     = 0.86    # inverter + wiring + soiling (~14% total loss)
+MAX_AZIMUTH_OFFSET = 120    # skip planes facing >this many degrees from due south
+
+PANEL_AREA_M2 = PANEL_WIDTH_M * PANEL_HEIGHT_M           # m² per module
+MODULE_EFF    = PANEL_WATTS / (PANEL_AREA_M2 * 1000.0)   # derived STC efficiency
 
 MIN_ROOF_POINTS = 20            # skip buildings with fewer LiDAR points than this
 RANSAC_ITERATIONS = 300         # lower = faster, higher = more accurate
@@ -129,6 +152,7 @@ out geom;
     r = requests.post(
         "https://overpass-api.de/api/interpreter",
         data={"data": query},
+        headers={"User-Agent": "SolarGrader/1.0 (joshuawagnersd@gmail.com)"},
         timeout=90,
     )
     r.raise_for_status()
@@ -172,7 +196,7 @@ def get_tmy_data(lat, lon):
     Returns a DataFrame with hourly irradiance columns: ghi, dni, dhi.
     """
     print(f"  Fetching TMY data from PVGIS for ({lat:.3f}, {lon:.3f})...")
-    tmy, _, _, _ = pvlib.iotools.get_pvgis_tmy(
+    tmy, _ = pvlib.iotools.get_pvgis_tmy(  # pvlib >=0.11 returns (data, metadata)
         latitude=lat,
         longitude=lon,
         outputformat="json",
@@ -185,48 +209,67 @@ def get_tmy_data(lat, lon):
 
 # ── Step 4: LiDAR clipping ────────────────────────────────────────────────────
 
-def clip_lidar_to_building(tile_path, footprint_poly, buffer_deg=0.00002):
+def get_tile_srs(tile_path):
+    """Read the LiDAR tile's spatial reference (WKT) from its LAS header."""
+    p = pdal.Pipeline(json.dumps(
+        {"pipeline": [{"type": "readers.las", "filename": tile_path.replace("\\", "/"), "count": 1}]}
+    ))
+    p.execute()
+    md = p.metadata["metadata"]["readers.las"]
+    return md.get("comp_spatialreference") or md.get("spatialreference")
+
+
+def load_tile_points(tile_path):
     """
-    Use PDAL to extract LiDAR points that fall within a building footprint.
+    Read the entire LiDAR tile into memory ONCE as a structured numpy array.
+    Returns (points, X, Y) where X/Y are float views for fast bbox masking.
+    Reading once and filtering per-building in RAM is ~100x faster than
+    re-opening the 145 MB file for every building.
+    """
+    p = pdal.Pipeline(json.dumps(
+        {"pipeline": [{"type": "readers.las", "filename": tile_path.replace("\\", "/")}]}
+    ))
+    p.execute()
+    pts = p.arrays[0]
+    return pts, np.asarray(pts["X"], dtype=float), np.asarray(pts["Y"], dtype=float)
+
+
+def clip_lidar_to_building(tile_points, footprint_poly, transformer, buffer_m=0.5):
+    """
+    Extract LiDAR points inside a building footprint from already-loaded tile
+    points. The footprint comes in lon/lat (EPSG:4326); the tile is in projected
+    meters, so we reproject the polygon into the tile's CRS before clipping.
     Returns an (N, 3) numpy array of [X, Y, Z], or None if too few points.
     """
-    buffered_wkt = footprint_poly.buffer(buffer_deg).wkt
+    pts, X, Y = tile_points
+    proj_poly = shapely_transform(transformer.transform, footprint_poly).buffer(buffer_m)
 
-    pipeline_json = json.dumps(
-        {
-            "pipeline": [
-                {"type": "readers.las", "filename": tile_path.replace("\\", "/")},
-                {"type": "filters.crop", "polygon": buffered_wkt},
-            ]
-        }
-    )
-
-    try:
-        pipeline = pdal.Pipeline(pipeline_json)
-        pipeline.execute()
-        arrays = pipeline.arrays
-        if not arrays or len(arrays[0]) == 0:
-            return None
-
-        pts = arrays[0]
-
-        # Prefer building-classified points (class 6); fall back to height filter
-        if "Classification" in pts.dtype.names:
-            roof_pts = pts[pts["Classification"] == 6]
-            if len(roof_pts) < MIN_ROOF_POINTS:
-                z_min = pts["Z"].min()
-                roof_pts = pts[pts["Z"] > z_min + 2.0]
-        else:
-            z_min = pts["Z"].min()
-            roof_pts = pts[pts["Z"] > z_min + 2.0]
-
-        if len(roof_pts) < MIN_ROOF_POINTS:
-            return None
-
-        return np.column_stack([roof_pts["X"], roof_pts["Y"], roof_pts["Z"]])
-
-    except Exception:
+    # Fast bounding-box prefilter, then exact point-in-polygon on the small subset
+    minx, miny, maxx, maxy = proj_poly.bounds
+    bbox_mask = (X >= minx) & (X <= maxx) & (Y >= miny) & (Y <= maxy)
+    if not bbox_mask.any():
         return None
+
+    sub = pts[bbox_mask]
+    inside = shapely.contains_xy(proj_poly, sub["X"], sub["Y"])
+    sub = sub[inside]
+    if len(sub) == 0:
+        return None
+
+    # Prefer building-classified points (class 6); fall back to height filter
+    if "Classification" in sub.dtype.names:
+        roof_pts = sub[sub["Classification"] == 6]
+        if len(roof_pts) < MIN_ROOF_POINTS:
+            z_min = sub["Z"].min()
+            roof_pts = sub[sub["Z"] > z_min + 2.0]
+    else:
+        z_min = sub["Z"].min()
+        roof_pts = sub[sub["Z"] > z_min + 2.0]
+
+    if len(roof_pts) < MIN_ROOF_POINTS:
+        return None
+
+    return np.column_stack([roof_pts["X"], roof_pts["Y"], roof_pts["Z"]])
 
 
 # ── Step 5: Roof plane extraction (RANSAC) ────────────────────────────────────
@@ -238,6 +281,17 @@ def extract_roof_planes(points_xyz):
     """
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_xyz)
+
+    # Ground point density (points per m² of horizontal area) from ONE convex
+    # hull over all points. Used to size each plane by its point count — this
+    # avoids the inflation you get from summing overlapping per-plane hulls.
+    # Coordinates are in projected meters (tile CRS), so areas are already m².
+    all_xy = np.asarray(points_xyz)[:, :2]
+    try:
+        covered_m2 = float(ConvexHull(all_xy).volume) if len(all_xy) >= 3 else 0.0
+    except Exception:
+        covered_m2 = 0.0
+    ground_density = (len(points_xyz) / covered_m2) if covered_m2 > 0 else 0.0
 
     planes = []
     remaining = pcd
@@ -279,19 +333,15 @@ def extract_roof_planes(points_xyz):
         # In projected coords, +X=east, +Y=north → atan2(nx, ny) gives bearing
         azimuth_deg = float((np.degrees(np.arctan2(nx, ny)) + 360) % 360)
 
-        # Estimate plane area via convex hull of projected inlier points
-        inlier_pts = np.asarray(remaining.points)[inliers]
-        try:
-            if len(inlier_pts) >= 3:
-                hull = ConvexHull(inlier_pts[:, :2])
-                area_m2 = float(hull.volume)  # in 2D, .volume = area in coordinate units²
-                # If coords are in degrees (geographic), convert to m²
-                if abs(inlier_pts[0, 0]) < 180:  # likely lat/lon, not projected
-                    area_m2 *= (111320 ** 2) * np.cos(np.radians(np.mean(inlier_pts[:, 1])))
-            else:
-                area_m2 = 0.0
-        except Exception:
-            area_m2 = float(len(inlier_pts))  # rough fallback: 1 pt ≈ 1 m²
+        # Plane area = (inlier point count ÷ ground density) gives the plane's
+        # horizontal (ground-projected) area; dividing by cos(tilt) converts it
+        # to true tilted surface area. Each point belongs to exactly one plane,
+        # so summing these areas can never exceed the building's real footprint.
+        if ground_density > 0:
+            ground_area_m2 = len(inliers) / ground_density
+            area_m2 = ground_area_m2 / max(np.cos(np.radians(tilt_deg)), 0.1)
+        else:
+            area_m2 = 0.0
 
         planes.append(
             {
@@ -309,30 +359,44 @@ def extract_roof_planes(points_xyz):
 
 # ── Step 6: Solar potential calculation (pvlib) ───────────────────────────────
 
+def panels_on_plane(plane_area_m2):
+    """
+    How many whole panels physically fit on a roof plane of this area.
+    Approximate the plane as an equal-area square, erode it inward by the
+    fire-code setback on all sides, apply a packing factor, then divide by the
+    module footprint. Small/cut-up roofs lose proportionally more area — the
+    realistic behaviour a flat usable-% can't capture.
+    """
+    side = np.sqrt(plane_area_m2)
+    usable_side = max(0.0, side - 2 * ROOF_SETBACK_M)
+    usable_area = (usable_side ** 2) * PANEL_PACKING
+    return int(usable_area // PANEL_AREA_M2)
+
+
 def calculate_annual_kwh(lat, lon, tmy, planes):
     """
-    Calculate total annual kWh potential across all viable roof planes.
-    Returns (total_kwh, best_plane).
+    Estimate realistic annual production by packing whole panels onto each viable
+    roof plane and running pvlib's irradiance model for that plane's orientation.
+    Returns (total_kwh, best_plane, system_kw_dc, total_panels).
     """
     location = pvlib.location.Location(latitude=lat, longitude=lon, tz="Etc/GMT+5")
     solar_pos = location.get_solarposition(tmy.index)
 
-    PANEL_EFFICIENCY = 0.20   # typical monocrystalline panel
-    SYSTEM_LOSSES = 0.86      # inverter + wiring + soiling (~14% total loss)
-    MAX_PANEL_AREA = 150.0    # sanity cap in m² — no residential roof has more
-
     total_kwh = 0.0
+    total_panels = 0
     best_plane = None
     best_kwh = 0.0
 
     for plane in planes:
-        # Skip near-north-facing planes (>120° from south = not worth paneling)
-        if abs(plane["azimuth_deg"] - 180) > 120:
+        # Skip planes facing too far from due south to be worth paneling
+        if abs(plane["azimuth_deg"] - 180) > MAX_AZIMUTH_OFFSET:
             continue
 
-        area = min(plane["area_m2"], MAX_PANEL_AREA)
-        if area <= 0:
+        n_panels = panels_on_plane(plane["area_m2"])
+        if n_panels <= 0:
             continue
+
+        panel_area = n_panels * PANEL_AREA_M2
 
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=plane["tilt_deg"],
@@ -344,17 +408,18 @@ def calculate_annual_kwh(lat, lon, tmy, planes):
             dhi=tmy["dhi"],
         )
 
-        plane_kwh = float(
-            (poa["poa_global"].fillna(0) * area * PANEL_EFFICIENCY * SYSTEM_LOSSES).sum()
-            / 1000
-        )
+        # Annual plane-of-array irradiance (kWh/m²/yr) × panel area × efficiency
+        poa_annual = float(poa["poa_global"].fillna(0).sum() / 1000)
+        plane_kwh = poa_annual * panel_area * MODULE_EFF * SYSTEM_LOSSES
 
         total_kwh += plane_kwh
+        total_panels += n_panels
         if plane_kwh > best_kwh:
             best_kwh = plane_kwh
             best_plane = plane
 
-    return total_kwh, best_plane
+    system_kw_dc = total_panels * PANEL_WATTS / 1000.0
+    return total_kwh, best_plane, system_kw_dc, total_panels
 
 
 # ── Step 7: Grading ───────────────────────────────────────────────────────────
@@ -391,6 +456,9 @@ def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg):
 
 def setup_db(path):
     con = duckdb.connect(path)
+    # Fresh table each run so test results reflect only the current tile/bbox
+    # (the real multi-tile pipeline would accumulate instead of dropping).
+    con.execute("DROP TABLE IF EXISTS homes")
     con.execute("""
         CREATE TABLE IF NOT EXISTS homes (
             osm_id                BIGINT PRIMARY KEY,
@@ -402,6 +470,8 @@ def setup_db(path):
             primary_azimuth_deg   DOUBLE,
             roof_plane_count      INTEGER,
             annual_kwh_potential  DOUBLE,
+            system_kw_dc          DOUBLE,
+            panel_count           INTEGER,
             solar_score           INTEGER,
             solar_grade           VARCHAR(2),
             processed_at          TIMESTAMP
@@ -413,7 +483,7 @@ def setup_db(path):
 def save_result(con, building, result):
     con.execute(
         """
-        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             building["osm_id"],
@@ -425,6 +495,8 @@ def save_result(con, building, result):
             result["primary_azimuth"],
             result["plane_count"],
             result["annual_kwh"],
+            result["system_kw_dc"],
+            result["panel_count"],
             result["score"],
             result["grade"],
             pd.Timestamp.now(),
@@ -448,6 +520,16 @@ def main():
     print("\n[2/5] Downloading tile...")
     tile_path = download_tile(tile_info["downloadURL"], TILE_CACHE_DIR)
 
+    # Build a transformer from lon/lat (OSM) into the tile's projected CRS (meters)
+    tile_srs = get_tile_srs(tile_path)
+    transformer = Transformer.from_crs("EPSG:4326", tile_srs, always_xy=True)
+    print(f"  Tile CRS: {tile_srs.split(',')[0].split('[')[-1].strip(chr(34))}")
+
+    # Load the whole tile into memory once (filtered per-building in RAM below)
+    print("  Loading tile points into memory...")
+    tile_points = load_tile_points(tile_path)
+    print(f"  Loaded {len(tile_points[0]):,} points.")
+
     # 3. Get buildings
     print("\n[3/5] Fetching building footprints from OpenStreetMap...")
     buildings = get_buildings_from_osm(TEST_BBOX)
@@ -466,6 +548,7 @@ def main():
     counts = {"scored": 0, "skipped_no_points": 0, "skipped_no_planes": 0}
     grade_counts = {}
     timings = []
+    density_samples = []   # (n_points, footprint_m2) for buildings that had LiDAR
     t_total = time.time()
 
     for i, building in enumerate(buildings):
@@ -477,7 +560,9 @@ def main():
         )
 
         # Clip LiDAR
-        points = clip_lidar_to_building(tile_path, building["geometry"])
+        points = clip_lidar_to_building(tile_points, building["geometry"], transformer)
+        if points is not None:
+            density_samples.append((len(points), building["footprint_m2"]))
         if points is None:
             counts["skipped_no_points"] += 1
             continue
@@ -489,10 +574,10 @@ def main():
             continue
 
         # Solar calc
-        annual_kwh, best_plane = calculate_annual_kwh(
+        annual_kwh, best_plane, system_kw, n_panels = calculate_annual_kwh(
             building["lat"], building["lon"], tmy, planes
         )
-        if annual_kwh == 0 or best_plane is None:
+        if annual_kwh == 0 or best_plane is None or n_panels == 0:
             counts["skipped_no_planes"] += 1
             continue
 
@@ -509,6 +594,8 @@ def main():
                 "primary_azimuth": best_plane["azimuth_deg"],
                 "plane_count": len(planes),
                 "annual_kwh": annual_kwh,
+                "system_kw_dc": system_kw,
+                "panel_count": n_panels,
                 "grade": grade,
                 "score": score,
             },
@@ -541,11 +628,14 @@ def main():
     print(f"\n  Top 10 A/A+ leads:")
     df = con.execute("""
         SELECT lat, lon,
-               ROUND(annual_kwh_potential) AS kwh_yr,
-               ROUND(usable_roof_area_m2)  AS roof_m2,
-               ROUND(primary_tilt_deg)     AS tilt,
-               ROUND(primary_azimuth_deg)  AS azimuth,
-               solar_grade                 AS grade
+               ROUND(annual_kwh_potential)  AS kwh_yr,
+               ROUND(system_kw_dc, 1)       AS kw_dc,
+               panel_count                  AS panels,
+               ROUND(footprint_m2)          AS osm_m2,
+               ROUND(usable_roof_area_m2)   AS roof_m2,
+               ROUND(primary_tilt_deg)      AS tilt,
+               ROUND(primary_azimuth_deg)   AS azimuth,
+               solar_grade                  AS grade
         FROM homes
         WHERE solar_grade IN ('A+', 'A')
         ORDER BY annual_kwh_potential DESC
@@ -558,23 +648,38 @@ def main():
     else:
         print(df.to_string(index=False))
 
-    # Diagnostic: LiDAR point density check
+    # Realism check: specific yield (kWh per kW). PA should land ~1,100–1,300.
+    print(f"\n  Realism check (kWh per kW installed — PA expected ~1,100–1,300):")
+    yields = con.execute("""
+        SELECT annual_kwh_potential / system_kw_dc AS specific_yield, system_kw_dc
+        FROM homes WHERE system_kw_dc > 0
+    """).fetchdf()
+    if not yields.empty:
+        med_yield = float(yields["specific_yield"].median())
+        med_kw = float(yields["system_kw_dc"].median())
+        print(f"    Median specific yield: ~{med_yield:,.0f} kWh/kW   (median system: {med_kw:.1f} kW DC)")
+        if 950 <= med_yield <= 1450:
+            print("    OK — production is in the physically realistic range.")
+        else:
+            print("    WARNING — outside the expected band; the panel/energy model needs review.")
+
+    # Diagnostic: LiDAR point density check (averaged over buildings that had LiDAR)
     print(f"\n  LiDAR density check:")
-    sample = buildings[0] if buildings else None
-    if sample:
-        pts = clip_lidar_to_building(tile_path, sample["geometry"])
-        if pts is not None:
-            footprint_m2 = sample["footprint_m2"]
-            density = len(pts) / max(footprint_m2, 1)
-            print(f"    Sample building: {len(pts)} points over ~{footprint_m2:.0f} m²")
-            print(f"    Point density: ~{density:.2f} pts/m²")
-            if density < 0.5:
-                print("    WARNING: Low density (<0.5 pts/m²) — RANSAC results may be unreliable.")
-                print("    Consider finding a higher-density tile for this area.")
-            elif density >= 4:
-                print("    Density is good — RANSAC results should be reliable.")
-            else:
-                print("    Density is acceptable.")
+    if density_samples:
+        densities = [n / max(fp, 1) for n, fp in density_samples]
+        density = float(np.median(densities))
+        print(f"    Buildings with LiDAR: {len(density_samples)} of {len(buildings)}")
+        print(f"    Median point density: ~{density:.2f} pts/m²")
+        if density < 0.5:
+            print("    WARNING: Low density (<0.5 pts/m²) — RANSAC results may be unreliable.")
+            print("    Consider finding a higher-density tile for this area.")
+        elif density >= 4:
+            print("    Density is good — RANSAC results should be reliable.")
+        else:
+            print("    Density is acceptable.")
+    else:
+        print("    No buildings overlapped the tile — density unknown.")
+        print("    The test bbox is likely larger than this single tile's footprint.")
 
     print(f"\n  Results saved to: {DB_PATH}")
     print(f"  Open with: python -c \"import duckdb; print(duckdb.connect('{DB_PATH}').execute('SELECT * FROM homes LIMIT 5').fetchdf())\"")
