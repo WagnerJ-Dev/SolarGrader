@@ -54,6 +54,7 @@ ROOF_SETBACK_M    = 0.46    # fire-code clear pathway from plane edges (~18 inch
 PANEL_PACKING     = 0.90    # fraction of the setback area that packs into whole modules
 SYSTEM_LOSSES     = 0.86    # inverter + wiring + soiling (~14% total loss)
 MAX_AZIMUTH_OFFSET = 120    # skip planes facing >this many degrees from due south
+MAX_SYSTEM_KW     = 10.0    # cap for a typical sellable residential install (DC kW)
 
 PANEL_AREA_M2 = PANEL_WIDTH_M * PANEL_HEIGHT_M           # m² per module
 MODULE_EFF    = PANEL_WATTS / (PANEL_AREA_M2 * 1000.0)   # derived STC efficiency
@@ -375,18 +376,17 @@ def panels_on_plane(plane_area_m2):
 
 def calculate_annual_kwh(lat, lon, tmy, planes):
     """
-    Estimate realistic annual production by packing whole panels onto each viable
-    roof plane and running pvlib's irradiance model for that plane's orientation.
-    Returns (total_kwh, best_plane, system_kw_dc, total_panels).
+    Pack whole panels onto each viable roof plane (pvlib irradiance per plane),
+    then report TWO systems:
+      - max:         every panel that fits the roof (upside potential)
+      - residential: the best-producing panels up to MAX_SYSTEM_KW (sellable now)
+    Returns a dict with kWh / kW / panel counts for both, plus the best plane,
+    or None if no viable (south-ish, panel-fitting) planes exist.
     """
     location = pvlib.location.Location(latitude=lat, longitude=lon, tz="Etc/GMT+5")
     solar_pos = location.get_solarposition(tmy.index)
 
-    total_kwh = 0.0
-    total_panels = 0
-    best_plane = None
-    best_kwh = 0.0
-
+    viable = []   # (per_panel_kwh, n_panels, plane), best-producing first later
     for plane in planes:
         # Skip planes facing too far from due south to be worth paneling
         if abs(plane["azimuth_deg"] - 180) > MAX_AZIMUTH_OFFSET:
@@ -395,8 +395,6 @@ def calculate_annual_kwh(lat, lon, tmy, planes):
         n_panels = panels_on_plane(plane["area_m2"])
         if n_panels <= 0:
             continue
-
-        panel_area = n_panels * PANEL_AREA_M2
 
         poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=plane["tilt_deg"],
@@ -407,19 +405,37 @@ def calculate_annual_kwh(lat, lon, tmy, planes):
             dni=tmy["dni"],
             dhi=tmy["dhi"],
         )
+        # Annual production of ONE panel on this plane (kWh/yr)
+        poa_annual = float(poa["poa_global"].fillna(0).sum() / 1000)  # kWh/m²/yr
+        per_panel_kwh = poa_annual * PANEL_AREA_M2 * MODULE_EFF * SYSTEM_LOSSES
+        viable.append((per_panel_kwh, n_panels, plane))
 
-        # Annual plane-of-array irradiance (kWh/m²/yr) × panel area × efficiency
-        poa_annual = float(poa["poa_global"].fillna(0).sum() / 1000)
-        plane_kwh = poa_annual * panel_area * MODULE_EFF * SYSTEM_LOSSES
+    if not viable:
+        return None
 
-        total_kwh += plane_kwh
-        total_panels += n_panels
-        if plane_kwh > best_kwh:
-            best_kwh = plane_kwh
-            best_plane = plane
+    # Max system: every panel that physically fits the roof
+    max_panels = sum(n for _, n, _ in viable)
+    max_kwh = sum(ppk * n for ppk, n, _ in viable)
+    max_kw = max_panels * PANEL_WATTS / 1000.0
 
-    system_kw_dc = total_panels * PANEL_WATTS / 1000.0
-    return total_kwh, best_plane, system_kw_dc, total_panels
+    # Residential system: fill the best-producing panels first, up to the kW cap
+    cap_panels = int(MAX_SYSTEM_KW * 1000 / PANEL_WATTS)
+    res_panels = 0
+    res_kwh = 0.0
+    for per_panel_kwh, n_panels, _ in sorted(viable, key=lambda v: v[0], reverse=True):
+        take = min(n_panels, cap_panels - res_panels)
+        if take <= 0:
+            break
+        res_panels += take
+        res_kwh += take * per_panel_kwh
+    res_kw = res_panels * PANEL_WATTS / 1000.0
+
+    best_plane = max(viable, key=lambda v: v[0])[2]
+    return {
+        "res_kwh": res_kwh, "res_kw": res_kw, "res_panels": res_panels,
+        "max_kwh": max_kwh, "max_kw": max_kw, "max_panels": max_panels,
+        "best_plane": best_plane,
+    }
 
 
 # ── Step 7: Grading ───────────────────────────────────────────────────────────
@@ -452,6 +468,19 @@ def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg):
     else:              return "D",  score
 
 
+def grade_potential(max_kw):
+    """
+    Tier a roof by its MAXIMUM installable capacity (kW DC) — the upside beyond a
+    standard residential system (battery, EV, future expansion, or commercial).
+    Separate from the residential sales grade, which is about the sellable system.
+    """
+    if max_kw >= 30:   return "P1"   # very high — large/commercial-scale roof
+    elif max_kw >= 20: return "P2"
+    elif max_kw >= 12: return "P3"
+    elif max_kw >= 7:  return "P4"
+    else:              return "P5"   # limited — barely fits a full residential set
+
+
 # ── Step 8: Database ──────────────────────────────────────────────────────────
 
 def setup_db(path):
@@ -469,11 +498,15 @@ def setup_db(path):
             primary_tilt_deg      DOUBLE,
             primary_azimuth_deg   DOUBLE,
             roof_plane_count      INTEGER,
-            annual_kwh_potential  DOUBLE,
-            system_kw_dc          DOUBLE,
-            panel_count           INTEGER,
+            res_annual_kwh        DOUBLE,
+            res_system_kw         DOUBLE,
+            res_panel_count       INTEGER,
             solar_score           INTEGER,
             solar_grade           VARCHAR(2),
+            max_annual_kwh        DOUBLE,
+            max_system_kw         DOUBLE,
+            max_panel_count       INTEGER,
+            potential_grade       VARCHAR(2),
             processed_at          TIMESTAMP
         )
     """)
@@ -483,7 +516,7 @@ def setup_db(path):
 def save_result(con, building, result):
     con.execute(
         """
-        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             building["osm_id"],
@@ -494,11 +527,15 @@ def save_result(con, building, result):
             result["primary_tilt"],
             result["primary_azimuth"],
             result["plane_count"],
-            result["annual_kwh"],
-            result["system_kw_dc"],
-            result["panel_count"],
+            result["res_kwh"],
+            result["res_kw"],
+            result["res_panels"],
             result["score"],
             result["grade"],
+            result["max_kwh"],
+            result["max_kw"],
+            result["max_panels"],
+            result["potential_grade"],
             pd.Timestamp.now(),
         ],
     )
@@ -573,17 +610,17 @@ def main():
             counts["skipped_no_planes"] += 1
             continue
 
-        # Solar calc
-        annual_kwh, best_plane, system_kw, n_panels = calculate_annual_kwh(
-            building["lat"], building["lon"], tmy, planes
-        )
-        if annual_kwh == 0 or best_plane is None or n_panels == 0:
+        # Solar calc — returns both a residential-capped and a max-roof system
+        sysres = calculate_annual_kwh(building["lat"], building["lon"], tmy, planes)
+        if sysres is None or sysres["res_panels"] == 0:
             counts["skipped_no_planes"] += 1
             continue
 
-        # Grade
+        # Grade: residential = sellable system (lead quality); potential = max roof
+        best_plane = sysres["best_plane"]
         total_area = sum(p["area_m2"] for p in planes)
-        grade, score = grade_home(annual_kwh, total_area, best_plane["azimuth_deg"])
+        grade, score = grade_home(sysres["res_kwh"], total_area, best_plane["azimuth_deg"])
+        potential_grade = grade_potential(sysres["max_kw"])
 
         save_result(
             con,
@@ -593,9 +630,13 @@ def main():
                 "primary_tilt": best_plane["tilt_deg"],
                 "primary_azimuth": best_plane["azimuth_deg"],
                 "plane_count": len(planes),
-                "annual_kwh": annual_kwh,
-                "system_kw_dc": system_kw,
-                "panel_count": n_panels,
+                "res_kwh": sysres["res_kwh"],
+                "res_kw": sysres["res_kw"],
+                "res_panels": sysres["res_panels"],
+                "max_kwh": sysres["max_kwh"],
+                "max_kw": sysres["max_kw"],
+                "max_panels": sysres["max_panels"],
+                "potential_grade": potential_grade,
                 "grade": grade,
                 "score": score,
             },
@@ -625,20 +666,20 @@ def main():
         if n:
             print(f"    {g:2s}  {'█' * n}  ({n})")
 
-    print(f"\n  Top 10 A/A+ leads:")
+    print(f"\n  Top 10 A/A+ leads (res = sellable ~{MAX_SYSTEM_KW:.0f}kW system, max = full-roof upside):")
     df = con.execute("""
         SELECT lat, lon,
-               ROUND(annual_kwh_potential)  AS kwh_yr,
-               ROUND(system_kw_dc, 1)       AS kw_dc,
-               panel_count                  AS panels,
-               ROUND(footprint_m2)          AS osm_m2,
-               ROUND(usable_roof_area_m2)   AS roof_m2,
+               solar_grade                  AS grade,
+               ROUND(res_system_kw, 1)      AS res_kw,
+               ROUND(res_annual_kwh)        AS res_kwh,
+               potential_grade              AS pot,
+               ROUND(max_system_kw, 1)      AS max_kw,
+               ROUND(max_annual_kwh)        AS max_kwh,
                ROUND(primary_tilt_deg)      AS tilt,
-               ROUND(primary_azimuth_deg)   AS azimuth,
-               solar_grade                  AS grade
+               ROUND(primary_azimuth_deg)   AS azimuth
         FROM homes
         WHERE solar_grade IN ('A+', 'A')
-        ORDER BY annual_kwh_potential DESC
+        ORDER BY res_annual_kwh DESC, max_annual_kwh DESC
         LIMIT 10
     """).fetchdf()
 
@@ -651,13 +692,13 @@ def main():
     # Realism check: specific yield (kWh per kW). PA should land ~1,100–1,300.
     print(f"\n  Realism check (kWh per kW installed — PA expected ~1,100–1,300):")
     yields = con.execute("""
-        SELECT annual_kwh_potential / system_kw_dc AS specific_yield, system_kw_dc
-        FROM homes WHERE system_kw_dc > 0
+        SELECT res_annual_kwh / res_system_kw AS specific_yield, res_system_kw
+        FROM homes WHERE res_system_kw > 0
     """).fetchdf()
     if not yields.empty:
         med_yield = float(yields["specific_yield"].median())
-        med_kw = float(yields["system_kw_dc"].median())
-        print(f"    Median specific yield: ~{med_yield:,.0f} kWh/kW   (median system: {med_kw:.1f} kW DC)")
+        med_kw = float(yields["res_system_kw"].median())
+        print(f"    Median specific yield: ~{med_yield:,.0f} kWh/kW   (median res system: {med_kw:.1f} kW DC)")
         if 950 <= med_yield <= 1450:
             print("    OK — production is in the physically realistic range.")
         else:
