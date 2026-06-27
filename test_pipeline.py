@@ -55,6 +55,8 @@ PANEL_PACKING     = 0.90    # fraction of the setback area that packs into whole
 SYSTEM_LOSSES     = 0.86    # inverter + wiring + soiling (~14% total loss)
 MAX_AZIMUTH_OFFSET = 120    # skip planes facing >this many degrees from due south
 MAX_SYSTEM_KW     = 10.0    # cap for a typical sellable residential install (DC kW)
+SHADE_RADIUS_M    = 50.0    # search radius for shading obstructions (trees, neighbours)
+HORIZON_BINS      = 72      # azimuth bins for the roof skyline (5° each)
 
 PANEL_AREA_M2 = PANEL_WIDTH_M * PANEL_HEIGHT_M           # m² per module
 MODULE_EFF    = PANEL_WATTS / (PANEL_AREA_M2 * 1000.0)   # derived STC efficiency
@@ -374,19 +376,70 @@ def panels_on_plane(plane_area_m2):
     return int(usable_area // PANEL_AREA_M2)
 
 
-def calculate_annual_kwh(lat, lon, tmy, planes):
+def compute_horizon(tile_points, observer_xyz, exclude_poly=None,
+                    radius_m=SHADE_RADIUS_M, n_bins=HORIZON_BINS):
+    """
+    Build the roof's skyline: the maximum obstruction elevation (degrees above the
+    roof) in each compass direction, using surrounding LiDAR points — trees,
+    neighbouring buildings — within radius_m. Points inside exclude_poly (the
+    building's OWN footprint, in tile CRS) are dropped so a roof can't shade
+    itself. Returns an array indexed by azimuth bin (0=N, clockwise); all zeros =
+    wide-open sky.
+    """
+    pts, X, Y = tile_points
+    ox, oy, oz = observer_xyz
+    horizon = np.zeros(n_bins)
+
+    m = (X >= ox - radius_m) & (X <= ox + radius_m) & (Y >= oy - radius_m) & (Y <= oy + radius_m)
+    if not m.any():
+        return horizon
+
+    sx, sy = X[m], Y[m]
+    sz = np.asarray(pts["Z"], dtype=float)[m]
+    # Drop the building's own roof so it can't count as an obstruction to itself
+    if exclude_poly is not None:
+        outside = ~shapely.contains_xy(exclude_poly, sx, sy)
+        sx, sy, sz = sx[outside], sy[outside], sz[outside]
+
+    dx = sx - ox
+    dy = sy - oy
+    dz = sz - oz
+    horiz = np.sqrt(dx * dx + dy * dy)
+    # Keep points within radius, not right on top of us, and ABOVE the roof
+    keep = (horiz <= radius_m) & (horiz > 1.0) & (dz > 0)
+    if not keep.any():
+        return horizon
+
+    dx, dy, dz, horiz = dx[keep], dy[keep], dz[keep], horiz[keep]
+    elev = np.degrees(np.arctan2(dz, horiz))                    # elevation angle
+    az = (np.degrees(np.arctan2(dx, dy)) + 360) % 360           # 0=N, 90=E (compass)
+    bins = (az / (360.0 / n_bins)).astype(int) % n_bins
+    np.maximum.at(horizon, bins, elev)                          # tallest per direction
+    return horizon
+
+
+def calculate_annual_kwh(lat, lon, tmy, planes, horizon=None):
     """
     Pack whole panels onto each viable roof plane (pvlib irradiance per plane),
     then report TWO systems:
       - max:         every panel that fits the roof (upside potential)
       - residential: the best-producing panels up to MAX_SYSTEM_KW (sellable now)
-    Returns a dict with kWh / kW / panel counts for both, plus the best plane,
-    or None if no viable (south-ish, panel-fitting) planes exist.
+    If a horizon (skyline) is given, the direct beam is removed during hours when
+    the sun sits below the skyline, and shade_loss_pct reports the production lost.
+    Returns a dict (incl. shade_loss_pct) or None if no viable planes exist.
     """
     location = pvlib.location.Location(latitude=lat, longitude=lon, tz="Etc/GMT+5")
     solar_pos = location.get_solarposition(tmy.index)
 
-    viable = []   # (per_panel_kwh, n_panels, plane), best-producing first later
+    # Per-hour direct-beam shading mask: sun up but below the roof's skyline
+    sun_blocked = None
+    if horizon is not None:
+        sun_elev = 90.0 - solar_pos["apparent_zenith"].values
+        sun_az = solar_pos["azimuth"].values
+        sun_bins = (sun_az / (360.0 / len(horizon))).astype(int) % len(horizon)
+        sun_blocked = (sun_elev > 0) & (sun_elev <= horizon[sun_bins])
+
+    viable = []   # (per_panel_shaded, per_panel_unshaded, n_panels, plane)
     for plane in planes:
         # Skip planes facing too far from due south to be worth paneling
         if abs(plane["azimuth_deg"] - 180) > MAX_AZIMUTH_OFFSET:
@@ -405,42 +458,52 @@ def calculate_annual_kwh(lat, lon, tmy, planes):
             dni=tmy["dni"],
             dhi=tmy["dhi"],
         )
-        # Annual production of ONE panel on this plane (kWh/yr)
-        poa_annual = float(poa["poa_global"].fillna(0).sum() / 1000)  # kWh/m²/yr
-        per_panel_kwh = poa_annual * PANEL_AREA_M2 * MODULE_EFF * SYSTEM_LOSSES
-        viable.append((per_panel_kwh, n_panels, plane))
+        glob = poa["poa_global"].fillna(0).values
+        unshaded_annual = glob.sum() / 1000  # kWh/m²/yr with full sun
+        if sun_blocked is not None:
+            # Remove the beam component during blocked hours (diffuse still counts)
+            direct = poa["poa_direct"].fillna(0).values
+            shaded_annual = (glob - direct * sun_blocked).sum() / 1000
+        else:
+            shaded_annual = unshaded_annual
+
+        ppk_shaded = shaded_annual * PANEL_AREA_M2 * MODULE_EFF * SYSTEM_LOSSES
+        ppk_unshaded = unshaded_annual * PANEL_AREA_M2 * MODULE_EFF * SYSTEM_LOSSES
+        viable.append((ppk_shaded, ppk_unshaded, n_panels, plane))
 
     if not viable:
         return None
 
     # Max system: every panel that physically fits the roof
-    max_panels = sum(n for _, n, _ in viable)
-    max_kwh = sum(ppk * n for ppk, n, _ in viable)
+    max_panels = sum(n for _, _, n, _ in viable)
+    max_kwh = sum(s * n for s, _, n, _ in viable)
+    max_unshaded = sum(u * n for _, u, n, _ in viable)
     max_kw = max_panels * PANEL_WATTS / 1000.0
+    shade_loss_pct = 100.0 * (1 - max_kwh / max_unshaded) if max_unshaded > 0 else 0.0
 
     # Residential system: fill the best-producing panels first, up to the kW cap
     cap_panels = int(MAX_SYSTEM_KW * 1000 / PANEL_WATTS)
     res_panels = 0
     res_kwh = 0.0
-    for per_panel_kwh, n_panels, _ in sorted(viable, key=lambda v: v[0], reverse=True):
+    for ppk_shaded, _, n_panels, _ in sorted(viable, key=lambda v: v[0], reverse=True):
         take = min(n_panels, cap_panels - res_panels)
         if take <= 0:
             break
         res_panels += take
-        res_kwh += take * per_panel_kwh
+        res_kwh += take * ppk_shaded
     res_kw = res_panels * PANEL_WATTS / 1000.0
 
-    best_plane = max(viable, key=lambda v: v[0])[2]
+    best_plane = max(viable, key=lambda v: v[0])[3]
     return {
         "res_kwh": res_kwh, "res_kw": res_kw, "res_panels": res_panels,
         "max_kwh": max_kwh, "max_kw": max_kw, "max_panels": max_panels,
-        "best_plane": best_plane,
+        "shade_loss_pct": shade_loss_pct, "best_plane": best_plane,
     }
 
 
 # ── Step 7: Grading ───────────────────────────────────────────────────────────
 
-def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg):
+def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg, shade_loss_pct):
     score = 0
 
     if annual_kwh >= 12000:    score += 50
@@ -457,8 +520,10 @@ def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg):
     elif offset <= 45:         score += 14
     elif offset <= 75:         score += 7
 
-    # Shade factor placeholder (always 1.0 until shade analysis is implemented)
-    score += 10
+    # Shade credit from the LiDAR skyline analysis (less shading = better lead)
+    if shade_loss_pct <= 5:    score += 10
+    elif shade_loss_pct <= 15: score += 7
+    elif shade_loss_pct <= 30: score += 4
 
     if score >= 85:    return "A+", score
     elif score >= 70:  return "A",  score
@@ -507,6 +572,7 @@ def setup_db(path):
             max_system_kw         DOUBLE,
             max_panel_count       INTEGER,
             potential_grade       VARCHAR(2),
+            shade_loss_pct        DOUBLE,
             processed_at          TIMESTAMP
         )
     """)
@@ -516,7 +582,7 @@ def setup_db(path):
 def save_result(con, building, result):
     con.execute(
         """
-        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO homes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             building["osm_id"],
@@ -536,6 +602,7 @@ def save_result(con, building, result):
             result["max_kw"],
             result["max_panels"],
             result["potential_grade"],
+            result["shade_loss_pct"],
             pd.Timestamp.now(),
         ],
     )
@@ -610,8 +677,16 @@ def main():
             counts["skipped_no_planes"] += 1
             continue
 
+        # Skyline shading from surrounding trees/buildings (observer = roof centroid),
+        # excluding the building's own footprint so it can't shade itself
+        observer = points.mean(axis=0)
+        own_footprint = shapely_transform(transformer.transform, building["geometry"]).buffer(1.0)
+        horizon = compute_horizon(tile_points, observer, own_footprint)
+
         # Solar calc — returns both a residential-capped and a max-roof system
-        sysres = calculate_annual_kwh(building["lat"], building["lon"], tmy, planes)
+        sysres = calculate_annual_kwh(
+            building["lat"], building["lon"], tmy, planes, horizon
+        )
         if sysres is None or sysres["res_panels"] == 0:
             counts["skipped_no_planes"] += 1
             continue
@@ -619,7 +694,9 @@ def main():
         # Grade: residential = sellable system (lead quality); potential = max roof
         best_plane = sysres["best_plane"]
         total_area = sum(p["area_m2"] for p in planes)
-        grade, score = grade_home(sysres["res_kwh"], total_area, best_plane["azimuth_deg"])
+        grade, score = grade_home(
+            sysres["res_kwh"], total_area, best_plane["azimuth_deg"], sysres["shade_loss_pct"]
+        )
         potential_grade = grade_potential(sysres["max_kw"])
 
         save_result(
@@ -637,6 +714,7 @@ def main():
                 "max_kw": sysres["max_kw"],
                 "max_panels": sysres["max_panels"],
                 "potential_grade": potential_grade,
+                "shade_loss_pct": sysres["shade_loss_pct"],
                 "grade": grade,
                 "score": score,
             },
@@ -672,6 +750,7 @@ def main():
                solar_grade                  AS grade,
                ROUND(res_system_kw, 1)      AS res_kw,
                ROUND(res_annual_kwh)        AS res_kwh,
+               ROUND(shade_loss_pct)        AS shade_pct,
                potential_grade              AS pot,
                ROUND(max_system_kw, 1)      AS max_kw,
                ROUND(max_annual_kwh)        AS max_kwh,
@@ -689,20 +768,24 @@ def main():
     else:
         print(df.to_string(index=False))
 
-    # Realism check: specific yield (kWh per kW). PA should land ~1,100–1,300.
-    print(f"\n  Realism check (kWh per kW installed — PA expected ~1,100–1,300):")
+    # Realism check: validate the PHYSICS on an UNSHADED basis (~1,100–1,300 in PA),
+    # and report real-world shading separately so it doesn't look like a model error.
+    print(f"\n  Realism check (UNSHADED kWh per kW — PA expected ~1,100–1,300):")
     yields = con.execute("""
-        SELECT res_annual_kwh / res_system_kw AS specific_yield, res_system_kw
+        SELECT (res_annual_kwh / NULLIF(1 - shade_loss_pct / 100.0, 0)) / res_system_kw
+                   AS unshaded_yield,
+               shade_loss_pct
         FROM homes WHERE res_system_kw > 0
     """).fetchdf()
     if not yields.empty:
-        med_yield = float(yields["specific_yield"].median())
-        med_kw = float(yields["res_system_kw"].median())
-        print(f"    Median specific yield: ~{med_yield:,.0f} kWh/kW   (median res system: {med_kw:.1f} kW DC)")
+        med_yield = float(yields["unshaded_yield"].median())
+        med_shade = float(yields["shade_loss_pct"].median())
+        print(f"    Median unshaded yield: ~{med_yield:,.0f} kWh/kW")
         if 950 <= med_yield <= 1450:
-            print("    OK — production is in the physically realistic range.")
+            print("    OK — the panel/energy physics is in the realistic range.")
         else:
             print("    WARNING — outside the expected band; the panel/energy model needs review.")
+        print(f"    Median shading loss:   {med_shade:.0f}%  (real reduction from trees/neighbours)")
 
     # Diagnostic: LiDAR point density check (averaged over buildings that had LiDAR)
     print(f"\n  LiDAR density check:")
