@@ -54,7 +54,7 @@ REGION_BBOX = (-75.620, 39.945, -75.595, 39.970)  # (west, south, east, north)
 PREFERRED_COLLECTION = "PA_17County_D24"
 
 # Cap tiles for a fast first validation; set to None to process the whole region.
-MAX_TILES = 3
+MAX_TILES = None
 
 DB_PATH = "solar_grader.duckdb"     # accumulating production DB (separate from the test)
 TILE_CACHE_DIR = "tile_stream"      # tiles downloaded here, then deleted after processing
