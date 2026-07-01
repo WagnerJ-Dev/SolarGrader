@@ -12,7 +12,9 @@ Run with:
     python pipeline.py
 """
 
+import math
 import os
+import re
 import time
 import warnings
 
@@ -20,6 +22,7 @@ import duckdb
 import pandas as pd
 import requests
 from pyproj import Transformer
+from shapely.geometry import Polygon
 from shapely.ops import transform as shapely_transform
 
 # The scoring algorithm — imported as-is from the validated test pipeline
@@ -55,6 +58,23 @@ PREFERRED_COLLECTION = "PA_17County_D24"
 
 # Cap tiles for a fast first validation; set to None to process the whole region.
 MAX_TILES = None
+
+# Building inventory source: "county" (Chester ArcGIS footprints — most complete
+# here, no Overpass rate limits) or "osm" (Overpass — incomplete, prototyping only).
+BUILDING_SOURCE = "county"
+COUNTY_FOOTPRINTS = (
+    "https://mapservices.pasda.psu.edu/server/rest/services/"
+    "pasda/ChesterCounty/MapServer/14/query"
+)
+
+# Fallback tile discovery when TNM's spatial query is down: browse the project's
+# staged LAZ directories on rockyweb and select tiles by the bbox→tile-name decode.
+# (Tile name USGS_LPC_..._18SVK<EEE><NNN> = UTM 18N easting EEE*1000, northing
+# 4,000,000 + NNN*1000. Verified against known tiles.) Scoped to this project.
+ROCKYWEB_PROJECT = (
+    "https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/Elevation/LPC/"
+    "Projects/PA_17County_D24"
+)
 
 DB_PATH = "solar_grader.duckdb"     # accumulating production DB (separate from the test)
 TILE_CACHE_DIR = "tile_stream"      # tiles downloaded here, then deleted after processing
@@ -93,6 +113,100 @@ def find_all_tiles(bbox, page=50):
 def tile_id_of(tile):
     """Stable id for a tile = its LAZ filename."""
     return tile["downloadURL"].split("/")[-1].split("?")[0]
+
+
+def _covering_tile_codes(bbox):
+    """The set of 6-digit tile codes (EEENNN) whose 1 km UTM cells cover bbox."""
+    fwd = Transformer.from_crs("EPSG:4326", "EPSG:26918", always_xy=True)  # UTM 18N
+    w, s, e, n = bbox
+    xs, ys = fwd.transform([w, e, w, e], [s, s, n, n])
+    e_range = range(int(min(xs) // 1000), int(max(xs) // 1000) + 1)
+    n_range = range(int((min(ys) - 4_000_000) // 1000), int((max(ys) - 4_000_000) // 1000) + 1)
+    return {f"{ee}{nn}" for ee in e_range for nn in n_range}
+
+
+def find_tiles_rockyweb(bbox):
+    """Fallback for when TNM is down: list the project's staged LAZ dirs on
+    rockyweb and pick tiles covering bbox via the tile-name UTM decode."""
+    codes = _covering_tile_codes(bbox)
+    index = requests.get(f"{ROCKYWEB_PROJECT}/", timeout=60).text
+    subprojects = sorted(set(re.findall(r'href="(PA_17Co_\d+_D24)/"', index)))
+
+    tiles, seen = [], set()
+    for sub in subprojects:
+        laz_url = f"{ROCKYWEB_PROJECT}/{sub}/LAZ/"
+        listing = requests.get(laz_url, timeout=90).text
+        for fn in re.findall(r"USGS_LPC_PA_17County_D24_18[A-Z]{3}\d{6}\.laz", listing):
+            code = fn[-10:-4]  # the 6 digits before ".laz"
+            if code in codes and fn not in seen:
+                seen.add(fn)
+                mgrs = fn[:-4].split("_")[-1]
+                tiles.append({
+                    "downloadURL": laz_url + fn,
+                    "title": f"USGS Lidar Point Cloud PA_17County_D24 {mgrs}",
+                    "sizeInBytes": 0,
+                })
+        if len(seen) >= len(codes):
+            break  # found every covering tile
+    return tiles
+
+
+# ── Building inventory sources ────────────────────────────────────────────────
+
+def get_buildings_from_county(bbox):
+    """Chester County building footprints (PASDA MapServer layer 14), bbox-queried.
+    Returns the same dict shape as get_buildings_from_osm so scoring is unchanged.
+    Uses an id-only query then batched geometry fetches (robust to the 1000 cap)."""
+    west, south, east, north = bbox
+    geom = {
+        "geometry": f"{west},{south},{east},{north}",
+        "geometryType": "esriGeometryEnvelope",
+        "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+    }
+    print("  Querying county building footprints...")
+    ids = requests.get(
+        COUNTY_FOOTPRINTS,
+        params={**geom, "where": "1=1", "returnIdsOnly": "true", "f": "json"},
+        timeout=90,
+    ).json().get("objectIds") or []
+
+    buildings = []
+    for i in range(0, len(ids), 200):
+        batch = ids[i:i + 200]
+        resp = requests.post(
+            COUNTY_FOOTPRINTS,
+            data={"objectIds": ",".join(map(str, batch)), "outFields": "OBJECTID",
+                  "returnGeometry": "true", "outSR": "4326", "f": "json"},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        for f in resp.json().get("features", []):
+            rings = (f.get("geometry") or {}).get("rings")
+            if not rings:
+                continue
+            try:
+                poly = Polygon(rings[0])  # exterior ring
+                if not poly.is_valid or poly.area == 0:
+                    continue
+            except Exception:
+                continue
+            cx, cy = poly.centroid.x, poly.centroid.y
+            deg2m2 = (111320 ** 2) * math.cos(math.radians(cy))
+            buildings.append({
+                "osm_id": int(f["attributes"]["OBJECTID"]),  # unique building id
+                "geometry": poly, "lat": cy, "lon": cx,
+                "footprint_m2": poly.area * deg2m2,
+            })
+    print(f"  Found {len(buildings)} buildings.")
+    return buildings
+
+
+def get_buildings(bbox):
+    """Dispatch to the configured building source."""
+    if BUILDING_SOURCE == "county":
+        return get_buildings_from_county(bbox)
+    return get_buildings_from_osm(bbox)
 
 
 def with_retries(fn, *args, attempts=4, base_delay=5, **kwargs):
@@ -209,13 +323,22 @@ def run(bbox, db_path=DB_PATH, tile_cache=TILE_CACHE_DIR):
     print("=" * 60)
 
     print("\nDiscovering LiDAR tiles...")
-    all_tiles = find_all_tiles(bbox)
+    all_tiles = with_retries(find_all_tiles, bbox)
+    if not all_tiles:
+        print("  TNM returned 0 (spatial query down) — falling back to direct")
+        print("  rockyweb tile discovery...")
+        all_tiles = with_retries(find_tiles_rockyweb, bbox)
+        print(f"  rockyweb found {len(all_tiles)} tiles.")
+    if not all_tiles:
+        print("  ABORT: no tiles from TNM or rockyweb. Both may be down — retry later.")
+        return
     tiles = [t for t in all_tiles if PREFERRED_COLLECTION in t.get("title", "")]
     dropped = len(all_tiles) - len(tiles)
     print(f"  {len(all_tiles)} tiles cover this region; {len(tiles)} match "
           f"'{PREFERRED_COLLECTION}', {dropped} other-collection tiles dropped.")
     if not tiles:
-        print("  ABORT: no tiles match the preferred collection — refusing to mix qualities.")
+        print(f"  ABORT: {len(all_tiles)} tiles found but none match "
+              f"'{PREFERRED_COLLECTION}' — refusing to mix collection qualities.")
         return
     if MAX_TILES is not None:
         tiles = tiles[:MAX_TILES]
@@ -241,7 +364,7 @@ def run(bbox, db_path=DB_PATH, tile_cache=TILE_CACHE_DIR):
             transformer = Transformer.from_crs("EPSG:4326", tile_srs, always_xy=True)
 
             tbbox = tile_latlon_bbox(tile_points, tile_srs)
-            buildings = with_retries(get_buildings_from_osm, tbbox)
+            buildings = with_retries(get_buildings, tbbox)
             if not buildings:
                 _mark_done(con, tid, 0)
                 _cleanup(path)

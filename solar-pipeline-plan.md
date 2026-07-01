@@ -48,15 +48,17 @@ A one-time data pipeline that produces a permanent, per-address solar score for 
 # Use USGS National Map Downloader to enumerate available tiles for PA bounding box
 ```
 
-### 1B. Building Footprints (Microsoft)
+### 1B. Building Footprints — pluggable source (the key to full coverage)
 
-**What it gives you:** 2D polygon outlines of every building. Used to mask LiDAR points to only those belonging to a specific building.
+**What it gives you:** 2D polygon outlines of every building. Used to mask LiDAR points to only those belonging to a specific building. Completeness here = how many houses end up scored, so this is the single biggest coverage lever.
 
-**How to get it:**
-- https://github.com/microsoft/buildings
-- Pennsylvania file: direct GeoJSON download (~300–400 MB)
-- Schema: geometry (polygon) + height estimate
-- Coverage: ~5.1M buildings in PA
+**Design:** a pluggable `get_buildings(bbox)` with interchangeable backends (scoring/address/grading downstream is identical regardless of source). Backends, from validation → scale:
+
+1. **OSM Overpass** — used in initial validation. Simple, per-bbox API, but **incomplete** (measured ~2,500 vs the county's 3,391 in West Chester = ~26% of buildings missing) and rate-limits/504s at scale. Fine for prototyping, not for coverage.
+2. **County ArcGIS footprint layer** (CURRENT for Chester rollout) — e.g. PASDA Chester County `MapServer/14` Building Footprints, bbox-queryable like the address layer. More complete than OSM, and **no Overpass rate-limit/504 problem**. Best where a county publishes footprints; downside is per-county endpoints.
+3. **Microsoft US Building Footprints** (for statewide → other states) — https://github.com/microsoft/USBuildingFootprints, ODbL, ~130M US buildings, one GeoJSON per state (~PA 5M). Quality ≥ OSM per Microsoft. Pattern: download state file once → load into a local spatial index (DuckDB spatial extension) → query per-tile locally. **Uniform national coverage = the "PA then state-by-state" unlock.**
+
+**Also:** record un-scoreable buildings (no roof / no viable plane) as a low/"not-viable" status instead of dropping them, so every structure appears in the output, not just solar-viable ones.
 
 ### 1C. Solar Irradiance (NREL NSRDB)
 
