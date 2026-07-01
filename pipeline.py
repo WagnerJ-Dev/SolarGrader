@@ -12,6 +12,8 @@ Run with:
     python pipeline.py
 """
 
+import gzip
+import json
 import math
 import os
 import re
@@ -19,6 +21,7 @@ import time
 import warnings
 
 import duckdb
+import numpy as np
 import pandas as pd
 import requests
 from pyproj import Transformer
@@ -67,6 +70,13 @@ COUNTY_FOOTPRINTS = (
     "pasda/ChesterCounty/MapServer/14/query"
 )
 
+# Microsoft Building Footprints (national, ODbL) — the scale-out source for areas
+# without a county service and for other states. Quadkey-partitioned GeoJSONL:
+# download the covering quadkey file once, then filter per tile. See DATA_SOURCES.md.
+MS_DATASET_LINKS = "https://minedbuildings.z5.web.core.windows.net/global-buildings/dataset-links.csv"
+MS_CACHE_DIR = "ms_cache"
+MS_ZOOM = 9
+
 # Fallback tile discovery when TNM's spatial query is down: browse the project's
 # staged LAZ directories on rockyweb and select tiles by the bbox→tile-name decode.
 # (Tile name USGS_LPC_..._18SVK<EEE><NNN> = UTM 18N easting EEE*1000, northing
@@ -79,6 +89,10 @@ ROCKYWEB_PROJECT = (
 DB_PATH = "solar_grader.duckdb"     # accumulating production DB (separate from the test)
 TILE_CACHE_DIR = "tile_stream"      # tiles downloaded here, then deleted after processing
 DELETE_TILES_AFTER = True           # the storage-capping mechanic; resume covers re-runs
+
+# Required data attribution — show wherever results are displayed. See DATA_SOURCES.md.
+ATTRIBUTION = ("Data: USGS 3DEP · Building footprints © Microsoft (ODbL) · "
+               "© OpenStreetMap contributors · Chester County GIS/PASDA · EU PVGIS")
 
 
 # ── Tile discovery ────────────────────────────────────────────────────────────
@@ -202,10 +216,109 @@ def get_buildings_from_county(bbox):
     return buildings
 
 
+def _quadkey(lon, lat, z=MS_ZOOM):
+    """Bing Maps quadkey for a lon/lat at zoom z (MS footprint partition scheme)."""
+    n = 2 ** z
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+    qk = ""
+    for i in range(z, 0, -1):
+        digit, mask = 0, 1 << (i - 1)
+        if x & mask: digit += 1
+        if y & mask: digit += 2
+        qk += str(digit)
+    return qk
+
+
+def _ms_link_for(qk):
+    """Look up the download URL for a US quadkey in MS's dataset index (cached)."""
+    os.makedirs(MS_CACHE_DIR, exist_ok=True)
+    links = os.path.join(MS_CACHE_DIR, "dataset-links.csv")
+    if not os.path.exists(links):
+        print("  Fetching MS dataset index (one-time)...")
+        r = requests.get(MS_DATASET_LINKS, timeout=180)
+        r.raise_for_status()
+        with open(links, "w") as f:
+            f.write(r.text)
+    with open(links) as f:
+        for line in f:
+            p = line.split(",")
+            if len(p) >= 3 and p[0] == "UnitedStates" and p[1] == qk:
+                return p[2]
+    return None
+
+
+_MS_CACHE = {}  # quadkey -> (centroids ndarray, list-of-rings)
+
+
+def _load_ms_quadkey(qk):
+    """Download (once) and parse a quadkey's GeoJSONL into centroids + rings."""
+    if qk in _MS_CACHE:
+        return _MS_CACHE[qk]
+    url = _ms_link_for(qk)
+    if not url:
+        _MS_CACHE[qk] = (np.empty((0, 2)), [])
+        return _MS_CACHE[qk]
+    path = os.path.join(MS_CACHE_DIR, f"{qk}.csv.gz")
+    if not os.path.exists(path):
+        print(f"  Downloading MS footprints quadkey {qk} (once)...")
+        r = requests.get(url, timeout=300)
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            f.write(r.content)
+    centroids, rings = [], []
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            try:
+                coords = json.loads(line)["geometry"]["coordinates"][0]
+            except Exception:
+                continue
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            centroids.append((sum(xs) / len(xs), sum(ys) / len(ys)))
+            rings.append(coords)
+    _MS_CACHE[qk] = (np.array(centroids), rings)
+    print(f"  Loaded {len(rings):,} MS buildings for quadkey {qk}.")
+    return _MS_CACHE[qk]
+
+
+def get_buildings_from_ms(bbox):
+    """Microsoft Building Footprints within bbox (national/other-states source).
+    Returns the same dict shape as the other backends."""
+    w, s, e, n = bbox
+    quadkeys = {_quadkey(lo, la) for lo in (w, e) for la in (s, n)}
+    buildings = []
+    for qk in quadkeys:
+        centroids, rings = _load_ms_quadkey(qk)
+        if len(centroids) == 0:
+            continue
+        cx, cy = centroids[:, 0], centroids[:, 1]
+        mask = (cx >= w) & (cx <= e) & (cy >= s) & (cy <= n)
+        qk_int = int(qk)
+        for idx in np.nonzero(mask)[0]:
+            try:
+                poly = Polygon(rings[idx])
+                if not poly.is_valid or poly.area == 0:
+                    continue
+            except Exception:
+                continue
+            lon, lat = float(cx[idx]), float(cy[idx])
+            deg2m2 = (111320 ** 2) * math.cos(math.radians(lat))
+            buildings.append({
+                "osm_id": qk_int * 10_000_000 + int(idx),  # stable unique id
+                "geometry": poly, "lat": lat, "lon": lon,
+                "footprint_m2": poly.area * deg2m2,
+            })
+    print(f"  Found {len(buildings)} buildings (MS footprints).")
+    return buildings
+
+
 def get_buildings(bbox):
     """Dispatch to the configured building source."""
     if BUILDING_SOURCE == "county":
         return get_buildings_from_county(bbox)
+    if BUILDING_SOURCE == "ms":
+        return get_buildings_from_ms(bbox)
     return get_buildings_from_osm(bbox)
 
 

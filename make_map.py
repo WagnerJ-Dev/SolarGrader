@@ -18,6 +18,8 @@ import warnings
 
 import duckdb
 
+from pipeline import ATTRIBUTION  # required data credits — keep displayed
+
 warnings.filterwarnings("ignore")
 
 DB_PATH = "solar_grader.duckdb"
@@ -100,7 +102,7 @@ const DATA = {geojson};
 const COLORS = {colors};
 const map = L.map('map').setView([{center_lat}, {center_lon}], 15);
 L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-  maxZoom: 19, attribution: '© OpenStreetMap'
+  maxZoom: 19, attribution: '{ATTRIBUTION}'
 }}).addTo(map);
 
 L.geoJSON(DATA, {{
