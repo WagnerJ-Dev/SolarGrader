@@ -110,36 +110,41 @@ def main():
         homes["lon"].max() + BBOX_MARGIN_DEG, homes["lat"].max() + BBOX_MARGIN_DEG,
     )
     pts = fetch_address_points(bbox)
-    if not pts:
-        print("No address points returned — check the region/service.")
-        return
-
-    lat0 = float(homes["lat"].median())
-    proj = _projector(lat0)
-    ax, ay = proj([p[0] for p in pts], [p[1] for p in pts])
-    tree = cKDTree(np.column_stack([ax, ay]))
-
-    hx, hy = proj(homes["lon"].values, homes["lat"].values)
-    dist, idx = tree.query(np.column_stack([hx, hy]), distance_upper_bound=MATCH_RADIUS_M)
-
     footprints = dict(zip(homes["osm_id"].values, homes["footprint_m2"].values))
     rows, matched = [], 0
-    for osm_id, d, j in zip(homes["osm_id"].values, dist, idx):
-        osm_id = int(osm_id)
-        foot = footprints.get(osm_id)
-        small = foot is None or foot < RESIDENTIAL_MAX_FOOTPRINT_M2
-        if np.isinf(d):
-            # No address match — classify residential on footprint alone
+
+    if not pts:
+        # No county address service covers this region (e.g. outside Chester).
+        # Classify residential by footprint only — no street addresses here.
+        print("  No county address points for this region — classifying residential"
+              " by footprint only (street addresses need that county's service).")
+        for osm_id in homes["osm_id"].values:
+            osm_id = int(osm_id)
+            foot = footprints.get(osm_id)
+            small = foot is None or foot < RESIDENTIAL_MAX_FOOTPRINT_M2
             rows.append((osm_id, None, None, None, None, None, None, small))
-            continue
-        matched += 1
-        a = pts[j][2]
-        full = (a.get("FULL_ADDRE") or "")
-        tax = a.get("TAX_EXEMPT")
-        has_unit = any(mk in f" {full.upper()}" for mk in UNIT_MARKERS)
-        is_res = (tax != "Yes") and (not has_unit) and small
-        rows.append((osm_id, full or None, a.get("ADDR_NUM"), a.get("ROAD_NAME"),
-                     a.get("MUNI_NAME"), a.get("ZIP_CODE_S"), tax, is_res))
+    else:
+        lat0 = float(homes["lat"].median())
+        proj = _projector(lat0)
+        ax, ay = proj([p[0] for p in pts], [p[1] for p in pts])
+        tree = cKDTree(np.column_stack([ax, ay]))
+        hx, hy = proj(homes["lon"].values, homes["lat"].values)
+        dist, idx = tree.query(np.column_stack([hx, hy]), distance_upper_bound=MATCH_RADIUS_M)
+        for osm_id, d, j in zip(homes["osm_id"].values, dist, idx):
+            osm_id = int(osm_id)
+            foot = footprints.get(osm_id)
+            small = foot is None or foot < RESIDENTIAL_MAX_FOOTPRINT_M2
+            if np.isinf(d):
+                rows.append((osm_id, None, None, None, None, None, None, small))
+                continue
+            matched += 1
+            a = pts[j][2]
+            full = (a.get("FULL_ADDRE") or "")
+            tax = a.get("TAX_EXEMPT")
+            has_unit = any(mk in f" {full.upper()}" for mk in UNIT_MARKERS)
+            is_res = (tax != "Yes") and (not has_unit) and small
+            rows.append((osm_id, full or None, a.get("ADDR_NUM"), a.get("ROAD_NAME"),
+                         a.get("MUNI_NAME"), a.get("ZIP_CODE_S"), tax, is_res))
 
     # Add columns (idempotent) and bulk-update via a join
     for col, typ in [("full_address", "VARCHAR"), ("house_number", "VARCHAR"),

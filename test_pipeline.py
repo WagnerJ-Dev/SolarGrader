@@ -503,27 +503,40 @@ def calculate_annual_kwh(lat, lon, tmy, planes, horizon=None):
 
 # ── Step 7: Grading ───────────────────────────────────────────────────────────
 
-def grade_home(annual_kwh, total_area_m2, primary_azimuth_deg, shade_loss_pct):
+def grade_home(res_annual_kwh, res_system_kw, primary_azimuth_deg):
+    """
+    Residential SALES grade (0-100) — how good a lead this roof is for a standard
+    home system. Driven by SPECIFIC YIELD (kWh per kW installed): a single physical
+    number that already integrates orientation, tilt, and shading. Total energy is
+    deliberately NOT the main axis — the residential system is capped (MAX_SYSTEM_KW),
+    so ~all adequately-sized roofs saturate that cap and total kWh stopped
+    discriminating (it collapsed every home to A/A+). Yield restores the spread:
+    a south-facing unshaded PA roof lands ~1400-1500 kWh/kW; a poorly-oriented or
+    shaded one ~900-1000. Roof SIZE is intentionally the other grade's job
+    (grade_potential / P1-P5), so it enters here only as a small-system penalty,
+    not a reward the capped majority would all collect.
+    """
+    yield_kwh_per_kw = res_annual_kwh / res_system_kw if res_system_kw else 0.0
     score = 0
 
-    if annual_kwh >= 12000:    score += 50
-    elif annual_kwh >= 9000:   score += 40
-    elif annual_kwh >= 6000:   score += 30
-    elif annual_kwh >= 3000:   score += 15
+    # Quality (dominant): specific yield. PA rooftop range ~900-1500 kWh/kW.
+    if   yield_kwh_per_kw >= 1400: score += 65
+    elif yield_kwh_per_kw >= 1300: score += 52
+    elif yield_kwh_per_kw >= 1200: score += 38
+    elif yield_kwh_per_kw >= 1100: score += 24
+    elif yield_kwh_per_kw >= 1000: score += 12
+    else:                          score += 4
 
-    if total_area_m2 >= 50:    score += 20
-    elif total_area_m2 >= 30:  score += 12
-    elif total_area_m2 >= 15:  score += 5
-
+    # Orientation: reinforces prime south-facing among similar-yield roofs.
     offset = abs(primary_azimuth_deg - 180)
-    if offset <= 15:           score += 20
-    elif offset <= 45:         score += 14
-    elif offset <= 75:         score += 7
+    if   offset <= 15: score += 25
+    elif offset <= 45: score += 17
+    elif offset <= 75: score += 7
 
-    # Shade credit from the LiDAR skyline analysis (less shading = better lead)
-    if shade_loss_pct <= 5:    score += 10
-    elif shade_loss_pct <= 15: score += 7
-    elif shade_loss_pct <= 30: score += 4
+    # Deal size: don't reward the capped majority; only penalize sub-residential roofs.
+    if   res_system_kw >= 7: score += 10
+    elif res_system_kw >= 5: score += 5
+    elif res_system_kw <  3: score -= 10
 
     if score >= 85:    return "A+", score
     elif score >= 70:  return "A",  score
@@ -695,7 +708,7 @@ def main():
         best_plane = sysres["best_plane"]
         total_area = sum(p["area_m2"] for p in planes)
         grade, score = grade_home(
-            sysres["res_kwh"], total_area, best_plane["azimuth_deg"], sysres["shade_loss_pct"]
+            sysres["res_kwh"], sysres["res_kw"], best_plane["azimuth_deg"]
         )
         potential_grade = grade_potential(sysres["max_kw"])
 
