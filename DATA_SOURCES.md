@@ -30,6 +30,6 @@ Display this wherever results are shown (maps, exports, reports):
 - **OSM basemap tiles** in `map.html` are fine for development but OSM's tile usage
   policy discourages heavy/commercial load — swap to a paid/self-hosted tile
   provider before launch (attribution to the chosen provider then applies).
-- The pipeline references this string via `ATTRIBUTION` in `pipeline.py`; keep the
-  two in sync.
+- The pipeline exposes this string as `Config.attribution` (see
+  `solargrader/config.py`) and shows it on generated maps; keep the two in sync.
 - Not legal advice — a licensing review is worthwhile before commercial launch.

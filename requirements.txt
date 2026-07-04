@@ -1,9 +1,18 @@
-pdal
-pvlib
-open3d
-duckdb
-geopandas
+# Runtime dependencies. The package is the source of truth — prefer:
+#     pip install -e ".[dev]"
+# This file mirrors the pip-installable deps for a plain `pip install -r`.
+#
+# The LiDAR reader (PDAL) is a SYSTEM library; install it via conda-forge:
+#     conda install -c conda-forge pdal python-pdal
+# then it is picked up here. Everything else installs from PyPI.
+
 numpy
 scipy
-requests
 pandas
+requests
+shapely
+pyproj
+duckdb
+pvlib
+open3d
+pdal        # requires system libpdal (see note above)

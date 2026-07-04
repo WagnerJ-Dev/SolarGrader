@@ -12,3 +12,11 @@ __pycache__/
 !.env.example
 ms_cache/
 tile_stream/
+
+# Python packaging / tooling
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+map.html
