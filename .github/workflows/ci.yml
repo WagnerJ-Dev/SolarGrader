@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The pure modules under test need only light, pip-installable deps — not the
+      # system LiDAR reader (PDAL). Heavy optional deps (PDAL, Open3D, pvlib) are
+      # imported lazily, so importing and testing the core works without them.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest numpy scipy pandas requests shapely pyproj duckdb
+          # Install the package itself (no deps — the pure-function tests don't need
+          # the heavy optional deps, which are imported lazily) so `solargrader` imports.
+          pip install -e . --no-deps
+
+      - name: Lint
+        run: ruff check solargrader tests
+
+      - name: Test
+        run: pytest -q

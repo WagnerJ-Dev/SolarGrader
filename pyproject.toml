@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solargrader"
+version = "0.1.0"
+description = "Score every rooftop in a region for solar sales potential from free public data"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "SolarGrader contributors" }]
+keywords = ["solar", "lidar", "gis", "lead-scoring", "pvlib", "usgs-3dep"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+# Core runtime deps that pip installs cleanly. The LiDAR reader (PDAL) is a system
+# library — install it separately (see the "lidar" extra and the README).
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "requests",
+    "shapely",
+    "pyproj",
+    "duckdb",
+    "pvlib",
+    "open3d",
+]
+
+[project.optional-dependencies]
+# PDAL's Python bindings need a system libpdal (best via conda-forge). Kept optional
+# so `pip install solargrader` works for everything except reading .laz tiles.
+lidar = ["pdal"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+solargrader = "solargrader.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/"
+Documentation = "https://github.com/"
+
+[tool.setuptools.packages.find]
+include = ["solargrader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Import the package from the repo root, so `pytest` works even without an install.
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# Sensible defaults; the pipeline deliberately catches broad exceptions at trust
+# boundaries (network, untrusted geometry), so BLE001 is silenced inline there.
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E203"]
