@@ -49,6 +49,8 @@ include = ["solargrader*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Import the package from the repo root, so `pytest` works even without an install.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100

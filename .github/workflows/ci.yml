@@ -25,6 +25,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install ruff pytest numpy scipy pandas requests shapely pyproj duckdb
+          # Install the package itself (no deps — the pure-function tests don't need
+          # the heavy optional deps, which are imported lazily) so `solargrader` imports.
+          pip install -e . --no-deps
 
       - name: Lint
         run: ruff check solargrader tests
